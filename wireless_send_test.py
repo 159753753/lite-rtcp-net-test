@@ -21,10 +21,11 @@ import sys
 import threading
 import time
 
-FRAME_HDR_FMT = "!BBH"          # magic(1) + channel(1) + length(2) = 4 bytes
-PAYLOAD_HDR_FMT = "!qq"         # send_ts_us(8) + seq_id(8) = 16 bytes
-FRAME_HDR_SIZE = 4
-PAYLOAD_HDR_SIZE = 16
+FRAME_HDR_FMT = "!3sBH"         # magic(3) + channel(1) + length(2) = 6 bytes
+PAYLOAD_HDR_FMT = "!qq3s"       # send_ts_us(8) + seq_id(8) + magic(3) = 19 bytes
+FRAME_HDR_SIZE = 6
+PAYLOAD_HDR_SIZE = 19
+MAGIC = b'\x66\xCC\xFF'         # shared magic for both TCP and UDP
 
 shutdown_event = threading.Event()
 
@@ -153,8 +154,10 @@ def udp_send_thread(label: str, src_addr: str, dest_addr: str, dest_port: int,
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
         sock.bind((src_addr, src_port))
-    except OSError:
-        pass
+    except OSError as e:
+        logger.error("Failed to bind UDP socket to %s:%d — %s", src_addr, src_port, e)
+        sock.close()
+        return
 
     bytes_per_packet = mtu
     packet_per_second = (bandwidth_kbps * 1000) / (bytes_per_packet * 8)
@@ -168,22 +171,26 @@ def udp_send_thread(label: str, src_addr: str, dest_addr: str, dest_port: int,
     )
 
     seq_id = 1
+    next_send_time = time.monotonic()
     while not shutdown_event.is_set():
         send_ts_us = time.time_ns() // 1_000
-        payload = struct.pack(PAYLOAD_HDR_FMT, send_ts_us, seq_id)
+        payload = struct.pack(PAYLOAD_HDR_FMT, send_ts_us, seq_id, MAGIC)
         payload = payload.ljust(mtu, b'\x00')
         try:
             sock.sendto(payload, (dest_addr, dest_port))
         except OSError:
             pass
         seq_id += 1
-        time.sleep(interval_s)
+        next_send_time += interval_s
+        sleep_time = next_send_time - time.monotonic()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
     sock.close()
     logger.info("UDP sender stopped (seq_id=%d)", seq_id)
 
 
-def tcp_send_thread(label: str, dest_addr: str, dest_port: int,
+def tcp_send_thread(label: str, src_addr: str, dest_addr: str, dest_port: int,
                     bandwidth_kbps: float, mtu_tcp: int, src_port: int,
                     shutdown_event: threading.Event) -> None:
     logger = _setup_port_logger(label, src_port)
@@ -193,19 +200,27 @@ def tcp_send_thread(label: str, dest_addr: str, dest_port: int,
     packet_per_second = (bandwidth_kbps * 1000) / (bytes_per_frame * 8)
     interval_s = 1.0 / packet_per_second
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(2.0)
-
+    # Use a fresh socket for each connect attempt; some platforms require it
+    # after a failed connect().
     connected = False
     while not shutdown_event.is_set() and not connected:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2.0)
+        if src_port > 0:
+            try:
+                sock.bind((src_addr, src_port))
+            except OSError as e:
+                logger.error("Failed to bind TCP socket to %s:%d — %s", src_addr, src_port, e)
+                sock.close()
+                return
         try:
             sock.connect((dest_addr, dest_port))
             connected = True
         except (ConnectionRefusedError, OSError):
+            sock.close()
             time.sleep(0.5)
 
     if not connected:
-        sock.close()
         return
 
     logger.info(
@@ -216,17 +231,21 @@ def tcp_send_thread(label: str, dest_addr: str, dest_port: int,
     )
 
     seq_id = 1
+    next_send_time = time.monotonic()
     while not shutdown_event.is_set():
         send_ts_us = time.time_ns() // 1_000
-        payload = struct.pack(PAYLOAD_HDR_FMT, send_ts_us, seq_id)
+        payload = struct.pack(PAYLOAD_HDR_FMT, send_ts_us, seq_id, MAGIC)
         payload = payload.ljust(payload_size, b'\x00')
-        frame = struct.pack(FRAME_HDR_FMT, 0x24, 0x00, payload_size) + payload
+        frame = struct.pack(FRAME_HDR_FMT, MAGIC, 0x00, payload_size) + payload
         try:
             sock.sendall(frame)
         except (BrokenPipeError, OSError):
             break
         seq_id += 1
-        time.sleep(interval_s)
+        next_send_time += interval_s
+        sleep_time = next_send_time - time.monotonic()
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
     sock.close()
     logger.info("TCP sender stopped (seq_id=%d)", seq_id)
@@ -339,7 +358,7 @@ def udp_1_2_tcp_1_proxy(cfg: configparser.ConfigParser) -> tuple:
     dst_tcp = _dst_port(cfg, "tcp_1_0_addr_to")
     t_tcp = threading.Thread(
         target=tcp_send_thread,
-        args=("tcp_main", dest_addr, dst_tcp, bw_tcp, mtu_tcp_val, src_tcp, shutdown_event),
+        args=("tcp_main", src_addr, dest_addr, dst_tcp, bw_tcp, mtu_tcp_val, src_tcp, shutdown_event),
         daemon=True,
     )
     t_tcp.start()

@@ -24,10 +24,11 @@ from collections import deque
 from dataclasses import dataclass, field
 from statistics import mean
 
-FRAME_HDR_FMT = "!BBH"
-PAYLOAD_HDR_FMT = "!qq"
-FRAME_HDR_SIZE = 4
-PAYLOAD_HDR_SIZE = 16
+FRAME_HDR_FMT = "!3sBH"
+PAYLOAD_HDR_FMT = "!qq3s"
+FRAME_HDR_SIZE = 6
+PAYLOAD_HDR_SIZE = 19
+MAGIC = b'\x66\xCC\xFF'
 
 shutdown_event = threading.Event()
 
@@ -43,6 +44,15 @@ class StreamStats:
     jitter_rfc3550: float = 0.0
     prev_latency_us: float = 0.0
     prev_latency_set: bool = False
+    seen_seq_ids: set = field(default_factory=set)
+    lost_seq_ids: set = field(default_factory=set)
+    seq_window_size: int = 500000
+    # --- NEW: instantaneous loss_rate tracking (sample-window based) ---
+    instant_loss_rate: float = 0.0
+    _sample_total: int = 0
+    _sample_loss: int = 0
+    _sample_interval: int = 1000
+    # --- END NEW ---
 
 
 def load_config(path: str) -> configparser.ConfigParser:
@@ -113,37 +123,76 @@ def _compute_window_entries(bandwidth_kbps: float, mtu: int) -> int:
 
 def _update_stats(stats: StreamStats, send_ts_us: int, seq_id: int) -> float:
     recv_ts_us = time.time_ns() // 1_000
-    with stats.lock:
-        stats.received_packets += 1
+    latency_us = float(recv_ts_us - send_ts_us)
 
+    with stats.lock:
         if seq_id > stats.total_packets:
+            gap_start = stats.total_packets + 1
+            gap_end = seq_id - 1
+            if gap_end >= gap_start and stats.received_packets > 0:
+                gap_size = gap_end - gap_start + 1
+                # Count gap entries already seen or already marked lost.
+                # Iterate over the smaller collection to keep large gaps fast.
+                tracked_count = len(stats.seen_seq_ids) + len(stats.lost_seq_ids)
+                if gap_size <= tracked_count:
+                    already_accounted = sum(
+                        1 for s in range(gap_start, gap_end + 1)
+                        if s in stats.seen_seq_ids or s in stats.lost_seq_ids
+                    )
+                else:
+                    already_accounted = sum(
+                        1 for s in stats.seen_seq_ids
+                        if gap_start <= s <= gap_end
+                    ) + sum(
+                        1 for s in stats.lost_seq_ids
+                        if gap_start <= s <= gap_end
+                    )
+                stats.lost_packets += gap_size - already_accounted
+                stats.lost_seq_ids.update(range(gap_start, gap_end + 1))
             stats.total_packets = seq_id
 
-        gap = 0
-        if stats.last_seq_id > 0 and seq_id > stats.last_seq_id + 1:
-            gap = seq_id - stats.last_seq_id - 1
-            stats.lost_packets += gap
+        if seq_id not in stats.seen_seq_ids:
+            stats.seen_seq_ids.add(seq_id)
+            stats.received_packets += 1
+            if seq_id in stats.lost_seq_ids:
+                stats.lost_seq_ids.remove(seq_id)
+                stats.lost_packets -= 1
 
-        latency_us = float(recv_ts_us - send_ts_us)
-        if gap > 0:
-            latency_us = latency_us / (gap + 1)
-
-        for _ in range(gap + 1):
             stats.latency_deque.append(latency_us)
 
-        stats.last_seq_id = seq_id
+            # RFC 3550: online jitter computation
+            if stats.prev_latency_set:
+                diff = abs(latency_us - stats.prev_latency_us)
+                stats.jitter_rfc3550 = stats.jitter_rfc3550 + (diff - stats.jitter_rfc3550) / 16.0
+            stats.prev_latency_us = latency_us
+            stats.prev_latency_set = True
 
-        # RFC 3550: online jitter computation
-        if stats.prev_latency_set:
-            diff = abs(latency_us - stats.prev_latency_us)
-            stats.jitter_rfc3550 = stats.jitter_rfc3550 + (diff - stats.jitter_rfc3550) / 16.0
-        stats.prev_latency_us = latency_us
-        stats.prev_latency_set = True
+            if seq_id > stats.last_seq_id:
+                stats.last_seq_id = seq_id
+
+        # Periodically prune old sequence IDs to prevent unbounded memory growth
+        if stats.total_packets % 10000 == 0 and stats.total_packets > stats.seq_window_size:
+            threshold = stats.total_packets - stats.seq_window_size
+            stats.seen_seq_ids = {s for s in stats.seen_seq_ids if s > threshold}
+            stats.lost_seq_ids = {s for s in stats.lost_seq_ids if s > threshold}
+
+        # --- NEW: compute instantaneous loss_rate over the sample window (packet-count based) ---
+        # calculate each _sample_interval packets, the loss rate over that interval
+        # defult _sample_interval is 1000 packets, can be adjusted in StreamStats
+        since_sample = stats.total_packets - stats._sample_total
+        if since_sample >= stats._sample_interval:
+            delta_total = since_sample
+            delta_loss = stats.lost_packets - stats._sample_loss
+            stats.instant_loss_rate = delta_loss / delta_total * 100.0 if delta_total > 0 else 0.0
+            stats._sample_total = stats.total_packets
+            stats._sample_loss = stats.lost_packets
+        # --- END NEW ---
 
     return latency_us
 
 
 def udp_recv_thread(label: str, listen_addr: str, listen_port: int,
+                    src_addr: str, src_port: int,
                     bandwidth_kbps: float, mtu: int, stats: StreamStats,
                     shutdown_event: threading.Event) -> None:
     logger = _setup_port_logger(label, listen_port)
@@ -154,18 +203,28 @@ def udp_recv_thread(label: str, listen_addr: str, listen_port: int,
     sock.bind((listen_addr, listen_port))
     sock.settimeout(1.0)
 
+    expected_src = (src_addr, src_port) if src_port > 0 else None
+
     while not shutdown_event.is_set():
         try:
-            data, _addr = sock.recvfrom(mtu)
+            data, addr = sock.recvfrom(mtu)
         except socket.timeout:
             continue
         except OSError:
             break
 
+        if expected_src is not None and addr != expected_src:
+            logger.debug("Ignoring packet from unexpected source %s:%d", addr[0], addr[1])
+            continue
+
         if len(data) < PAYLOAD_HDR_SIZE:
             continue
 
-        send_ts_us, seq_id = struct.unpack(PAYLOAD_HDR_FMT, data[:PAYLOAD_HDR_SIZE])
+        send_ts_us, seq_id, magic = struct.unpack(PAYLOAD_HDR_FMT, data[:PAYLOAD_HDR_SIZE])
+        if magic != MAGIC:
+            logger.debug("Ignoring UDP packet with bad magic 0x%04x", magic)
+            continue
+
         _update_stats(stats, send_ts_us, seq_id)
 
     sock.close()
@@ -210,13 +269,15 @@ def tcp_recv_thread(label: str, listen_addr: str, listen_port: int,
             if len(buffer) < FRAME_HDR_SIZE:
                 break
 
-            magic, channel, payload_size = struct.unpack(FRAME_HDR_FMT, buffer[:FRAME_HDR_SIZE])
-            buffer = buffer[FRAME_HDR_SIZE:]
+            frame_hdr = buffer[:FRAME_HDR_SIZE]
+            magic, channel, payload_size = struct.unpack(FRAME_HDR_FMT, frame_hdr)
 
-            if magic != 0x24:
-                idx = buffer.find(b'\x24')
+            if magic != MAGIC:
+                idx = buffer.find(MAGIC, 1)
                 buffer = buffer[idx:] if idx >= 0 else b''
                 continue
+
+            buffer = buffer[FRAME_HDR_SIZE:]
 
             # Phase 2: read payload
             while len(buffer) < payload_size:
@@ -238,7 +299,11 @@ def tcp_recv_thread(label: str, listen_addr: str, listen_port: int,
             if len(payload) < PAYLOAD_HDR_SIZE:
                 continue
 
-            send_ts_us, seq_id = struct.unpack(PAYLOAD_HDR_FMT, payload[:PAYLOAD_HDR_SIZE])
+            send_ts_us, seq_id, magic = struct.unpack(PAYLOAD_HDR_FMT, payload[:PAYLOAD_HDR_SIZE])
+            if magic != MAGIC:
+                logger.debug("Ignoring TCP frame with bad payload magic 0x%04x", magic)
+                continue
+
             _update_stats(stats, send_ts_us, seq_id)
 
         conn.close()
@@ -268,27 +333,31 @@ def _compute_stats_line(label: str, stats: StreamStats) -> str:
             latest_latency = 0.0
 
         if avg_lat == 0.0 or len(deque_list) < 2:
-            jitter_1889 = 0.0
-            jitter_1889_pct = 0.0
+            jitter_mean_abs = 0.0
+            jitter_mean_pct = 0.0
         else:
             diffs = [abs(deque_list[i] - deque_list[i - 1]) for i in range(1, len(deque_list))]
-            jitter_1889 = mean(diffs)
-            jitter_1889_pct = jitter_1889 / avg_lat * 100
+            jitter_mean_abs = mean(diffs)
+            jitter_mean_pct = jitter_mean_abs / avg_lat * 100
 
-        jitter_3550 = stats.jitter_rfc3550
+        jitter_rfc3550 = stats.jitter_rfc3550
         if avg_lat == 0.0:
-            jitter_3550_pct = 0.0
+            jitter_rfc3550_pct = 0.0
         else:
-            jitter_3550_pct = jitter_3550 / avg_lat * 100
+            jitter_rfc3550_pct = jitter_rfc3550 / avg_lat * 100
 
     return (
         f"[    INFO] [recv.{label}]: recv={recv}  loss={loss}  total={total}  "
-        f"loss_rate={loss_rate:.4f}%  latest_latency={latest_latency:.4f}us  "
+        f"loss_rate={loss_rate:.4f}%  "
+        # --- NEW: instantaneous loss_rate over the last sample window ---
+        f"instant_loss_rate={stats.instant_loss_rate:.4f}%  "
+        # --- END NEW ---
+        f"latest_latency={latest_latency:.4f}us  "
         f"avg_lat={avg_lat:.2f}us  "
-        f"jitter_RFC_1889={jitter_1889:.4f}us  "
-        f"jitter_RFC_1889_pct={jitter_1889_pct:.4f}%  "
-        f"jitter_RFC_3550={jitter_3550:.4f}us  "
-        f"jitter_RFC_3550_pct={jitter_3550_pct:.4f}%"
+        f"jitter_mean_abs={jitter_mean_abs:.4f}us  "
+        f"jitter_mean_pct={jitter_mean_pct:.4f}%  "
+        f"jitter_RFC_3550={jitter_rfc3550:.4f}us  "
+        f"jitter_RFC_3550_pct={jitter_rfc3550_pct:.4f}%"
     )
 
 
@@ -356,16 +425,26 @@ def _dst_port(cfg: configparser.ConfigParser, key: str) -> int:
     return cfg.getint("address_to", key, fallback=0)
 
 
+def _src_addr(cfg: configparser.ConfigParser) -> str:
+    return cfg.get("addr", "addr_send", fallback=None) or cfg.get("addr", "addr", fallback="127.0.0.1")
+
+
+def _src_port(cfg: configparser.ConfigParser, key: str) -> int:
+    return cfg.getint("address_from", key, fallback=0)
+
+
 def udp_1_recv(cfg: configparser.ConfigParser) -> list:
     addr = _addr(cfg)
+    src_addr = _src_addr(cfg)
     port = _dst_port(cfg, "udp_1_0_addr_to")
+    src_port = _src_port(cfg, "udp_1_0_addr_from")
     bw = _bw(cfg, "bandwidth_udp_1_0")
     mtu = _mtu(cfg)
     stats = StreamStats(latency_deque=deque(maxlen=_compute_window_entries(bw, mtu) * 2))
 
     t = threading.Thread(
         target=udp_recv_thread,
-        args=("udp_main", addr, port, bw, mtu, stats, shutdown_event),
+        args=("udp_main", addr, port, src_addr, src_port, bw, mtu, stats, shutdown_event),
         daemon=True,
     )
     t.start()
@@ -374,21 +453,23 @@ def udp_1_recv(cfg: configparser.ConfigParser) -> list:
 
 def udp_1_2_recv(cfg: configparser.ConfigParser) -> list:
     addr = _addr(cfg)
+    src_addr = _src_addr(cfg)
     mtu = _mtu(cfg)
     streams = [
-        ("udp_main", "bandwidth_udp_1_0", "udp_1_0_addr_to"),
-        ("udp_rec0", "bandwidth_udp_2_0", "udp_2_0_addr_to"),
-        ("udp_rec1", "bandwidth_udp_2_1", "udp_2_1_addr_to"),
+        ("udp_main", "bandwidth_udp_1_0", "udp_1_0_addr_to", "udp_1_0_addr_from"),
+        ("udp_rec0", "bandwidth_udp_2_0", "udp_2_0_addr_to", "udp_2_0_addr_from"),
+        ("udp_rec1", "bandwidth_udp_2_1", "udp_2_1_addr_to", "udp_2_1_addr_from"),
     ]
     threads = []
     stream_infos = []
-    for label, bw_key, dst_key in streams:
+    for label, bw_key, dst_key, src_key in streams:
         bw = _bw(cfg, bw_key)
         port = _dst_port(cfg, dst_key)
+        src_port = _src_port(cfg, src_key)
         stats = StreamStats(latency_deque=deque(maxlen=_compute_window_entries(bw, mtu) * 2))
         t = threading.Thread(
             target=udp_recv_thread,
-            args=(label, addr, port, bw, mtu, stats, shutdown_event),
+            args=(label, addr, port, src_addr, src_port, bw, mtu, stats, shutdown_event),
             daemon=True,
         )
         t.start()
@@ -399,23 +480,25 @@ def udp_1_2_recv(cfg: configparser.ConfigParser) -> list:
 
 def udp_1_2_tcp_1_recv(cfg: configparser.ConfigParser) -> list:
     addr = _addr(cfg)
+    src_addr = _src_addr(cfg)
     mtu = _mtu(cfg)
     mtu_tcp_val = _mtu_tcp(cfg)
     threads = []
     stream_infos = []
 
     udp_streams = [
-        ("udp_main", "bandwidth_udp_1_0", "udp_1_0_addr_to"),
-        ("udp_rec0", "bandwidth_udp_2_0", "udp_2_0_addr_to"),
-        ("udp_rec1", "bandwidth_udp_2_1", "udp_2_1_addr_to"),
+        ("udp_main", "bandwidth_udp_1_0", "udp_1_0_addr_to", "udp_1_0_addr_from"),
+        ("udp_rec0", "bandwidth_udp_2_0", "udp_2_0_addr_to", "udp_2_0_addr_from"),
+        ("udp_rec1", "bandwidth_udp_2_1", "udp_2_1_addr_to", "udp_2_1_addr_from"),
     ]
-    for label, bw_key, dst_key in udp_streams:
+    for label, bw_key, dst_key, src_key in udp_streams:
         bw = _bw(cfg, bw_key)
         port = _dst_port(cfg, dst_key)
+        src_port = _src_port(cfg, src_key)
         stats = StreamStats(latency_deque=deque(maxlen=_compute_window_entries(bw, mtu) * 2))
         t = threading.Thread(
             target=udp_recv_thread,
-            args=(label, addr, port, bw, mtu, stats, shutdown_event),
+            args=(label, addr, port, src_addr, src_port, bw, mtu, stats, shutdown_event),
             daemon=True,
         )
         t.start()
@@ -472,12 +555,7 @@ def main():
     print(f"[INFO] Active mode: {mode}")
     print("[INFO] Starting listener threads...")
 
-    result = select_proxies(cfg)
-    if len(result) == 2:
-        threads, stream_infos = result
-    else:
-        threads = result[0]
-        stream_infos = result[1]
+    threads, stream_infos = select_proxies(cfg)
 
     reporter = threading.Thread(
         target=stats_reporter,
